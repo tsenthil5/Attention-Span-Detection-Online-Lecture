@@ -1,0 +1,18 @@
+# Requirements — Attention-Span-Detection-Online-Lecture
+# Install with: pip install -r requirements.txt
+#
+# Additional setup:
+#   - dlib requires cmake: brew install cmake  (macOS) / apt install cmake (Linux)
+#   - pyaudio requires portaudio: brew install portaudio / apt install portaudio19-dev
+#   - Set GOOGLE_APPLICATION_CREDENTIALS env var for audio.py
+#   - Download model assets from the README before running
+
+opencv-python>=4.8.0
+dlib>=19.24.0
+imutils>=0.5.4
+scipy>=1.10.0
+numpy>=1.24.0
+pygame>=2.5.0
+google-cloud-speech>=2.20.0
+pyaudio>=0.2.13
+six>=1.16.0
