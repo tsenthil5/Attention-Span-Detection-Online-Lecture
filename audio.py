@@ -1,217 +1,168 @@
+"""
+audio.py
+--------
+Streams microphone audio to Google Cloud Speech-to-Text and prints transcripts
+in real time. Used as the audio-analysis component of the Attention Span
+Detection system.
 
-  
-#!/usr/bin/env python
+Prerequisites:
+    pip install google-cloud-speech pyaudio six
 
-# Copyright 2017 Google Inc. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+Authentication:
+    Set the GOOGLE_APPLICATION_CREDENTIALS environment variable to the path
+    of your Google Cloud service-account JSON key:
 
-"""Google Cloud Speech API sample application using the streaming API.
-NOTE: This module requires the additional dependency `pyaudio`. To install
-using pip:
-    pip install pyaudio
-Example usage:
-    python transcribe_streaming_mic.py
+        export GOOGLE_APPLICATION_CREDENTIALS=/path/to/your/key.json
+
+    See: https://cloud.google.com/docs/authentication/getting-started
+
+Usage:
+    python audio.py
 """
 
-# [START speech_transcribe_streaming_mic]
 from __future__ import division
 
-import re
 import os
+import re
 import sys
 import time
+from queue import Queue
 
-
-from google.cloud import speech
-from google.cloud.speech import enums
-from google.cloud.speech import types
 import pyaudio
-from six.moves import queue
+from google.cloud import speech
 
-
-list=[]
-credential_path= r"C:\Users\Navya Shenoy\Desktop\SIHH\sih.json" 
-os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credential_path
-
-
-# Audio recording parameters
+# ── Audio recording parameters ─────────────────────────────────
 RATE = 16000
-CHUNK = int(RATE / 10)  # 100ms
+CHUNK = int(RATE / 10)   # 100 ms chunks
+LANGUAGE_CODE = "en-US"
+EXIT_PHRASES = re.compile(r"\b(exit|quit)\b", re.I)
 
 
-class MicrophoneStream(object):
-    """Opens a recording stream as a generator yielding the audio chunks."""
-    def __init__(self, rate, chunk):
+class MicrophoneStream:
+    """Opens a recording stream as a generator yielding raw audio chunks."""
+
+    def __init__(self, rate: int = RATE, chunk: int = CHUNK) -> None:
         self._rate = rate
         self._chunk = chunk
-
-        # Create a thread-safe buffer of audio data
-        self._buff = queue.Queue()
+        self._buff: Queue = Queue()
         self.closed = True
 
-    def __enter__(self):
+    def __enter__(self) -> "MicrophoneStream":
         self._audio_interface = pyaudio.PyAudio()
         self._audio_stream = self._audio_interface.open(
             format=pyaudio.paInt16,
-            # The API currently only supports 1-channel (mono) audio
-            # https://goo.gl/z757pE
-            channels=1, rate=self._rate,
-            input=True, frames_per_buffer=self._chunk,
-            # Run the audio stream asynchronously to fill the buffer object.
-            # This is necessary so that the input device's buffer doesn't
-            # overflow while the calling thread makes network requests, etc.
+            channels=1,
+            rate=self._rate,
+            input=True,
+            frames_per_buffer=self._chunk,
             stream_callback=self._fill_buffer,
         )
-   
-
         self.closed = False
-
         return self
 
-    def __exit__(self, type, value, traceback):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self._audio_stream.stop_stream()
         self._audio_stream.close()
         self.closed = True
-        # Signal the generator to terminate so that the client's
-        # streaming_recognize method will not block the process termination.
         self._buff.put(None)
         self._audio_interface.terminate()
 
     def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
-        """Continuously collect data from the audio stream, into the buffer."""
+        """Callback: push incoming audio data onto the queue."""
         self._buff.put(in_data)
         return None, pyaudio.paContinue
 
     def generator(self):
+        """Yield audio chunks from the queue until the stream closes."""
         while not self.closed:
-            # Use a blocking get() to ensure there's at least one chunk of
-            # data, and stop iteration if the chunk is None, indicating the
-            # end of the audio stream.
             chunk = self._buff.get()
             if chunk is None:
                 return
             data = [chunk]
-
-            # Now consume whatever other data's still buffered.
             while True:
                 try:
                     chunk = self._buff.get(block=False)
                     if chunk is None:
                         return
                     data.append(chunk)
-                except queue.Empty:
+                except Exception:
                     break
+            yield b"".join(data)
 
-            yield b''.join(data)
 
+def listen_print_loop(responses) -> None:
+    """
+    Iterate over Speech-to-Text streaming responses and print transcripts.
 
-def listen_print_loop(responses):
-    """Iterates through server responses and prints them.
-    The responses passed is a generator that will block until a response
-    is provided by the server.
-    Each response may contain multiple results, and each result may contain
-    multiple alternatives; for details, see https://goo.gl/tjCPAU.  Here we
-    print only the transcription for the top alternative of the top result.
-    In this case, responses are provided for interim results as well. If the
-    response is an interim one, print a line feed at the end of it, to allow
-    the next result to overwrite it, until the response is a final one. For the
-    final one, print a newline to preserve the finalized transcription.
+    Exits when EXIT_PHRASES are detected or the stream ends.
     """
     num_chars_printed = 0
+
     for response in responses:
         if not response.results:
             continue
 
-        # The `results` list is consecutive. For streaming, we only care about
-        # the first result being considered, since once it's `is_final`, it
-        # moves on to considering the next utterance.
         result = response.results[0]
         if not result.alternatives:
             continue
 
-        # Display the transcription of the top alternative.
         transcript = result.alternatives[0].transcript
-       
-
-        # Display interim results, but with a carriage return at the end of the
-        # line, so subsequent lines will overwrite them.
-        #
-        # If the previous result was longer than this one, we need to print
-        # some extra spaces to overwrite the previous result
-        overwrite_chars = ' ' * (num_chars_printed - len(transcript))
+        overwrite_chars = " " * (num_chars_printed - len(transcript))
 
         if not result.is_final:
-            sys.stdout.write(transcript + overwrite_chars + '\r')
+            sys.stdout.write(transcript + overwrite_chars + "\r")
             sys.stdout.flush()
-            
-
             num_chars_printed = len(transcript)
-
         else:
-            print(response.results)
-            #print(transcript)
-            print("_____")
-            #print(overwrite_chars)
-           
-            
-            #print(list)
-
-
-            # Exit recognition if any of the transcribed phrases could be
-            # one of our keywords.
-            if re.search(r'\b(exit|quit|fuck)\b', transcript, re.I):
-                #print('Exiting..')
-                #print('lAST TS=',ts)
-                #print('FIRST TS=',list[0])
-                break
+            print(transcript + overwrite_chars)
             num_chars_printed = 0
 
+            if EXIT_PHRASES.search(transcript):
+                print("[INFO] Exit phrase detected — stopping.")
+                break
 
-def main():
-    # See http://g.co/cloud/speech/docs/languages
-    # for a list of supported languages.
-    language_code = 'en-US'  # a BCP-47 language tag
+
+def main() -> None:
+    """Authenticate, open the mic stream, and transcribe until exit."""
+    # Credentials are picked up automatically from the environment variable
+    # GOOGLE_APPLICATION_CREDENTIALS. Set it before running:
+    #   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
+    if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        print(
+            "[ERROR] GOOGLE_APPLICATION_CREDENTIALS is not set.\n"
+            "  Set it with: export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     client = speech.SpeechClient()
-    config = types.RecognitionConfig(
-        encoding=enums.RecognitionConfig.AudioEncoding.LINEAR16,
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=RATE,
-        language_code=language_code)
-    streaming_config = types.StreamingRecognitionConfig(
+        language_code=LANGUAGE_CODE,
+    )
+    streaming_config = speech.StreamingRecognitionConfig(
         config=config,
-        interim_results=True)
+        interim_results=True,
+    )
 
-    with MicrophoneStream(RATE, CHUNK) as stream:
-        audio_generator = stream.generator()
-        ts=time.time()
-        list.append(ts)
-        print(list)
-        
-        requests = (types.StreamingRecognizeRequest(audio_content=content)
-                    for content in audio_generator)
+    timestamps = [time.time()]
+    print(f"[INFO] Stream started at {timestamps[0]:.2f}")
 
-        responses = client.streaming_recognize(streaming_config, requests)
-
-        # Now, put the transcription responses to use.
-        
-        try: 
+    try:
+        with MicrophoneStream(RATE, CHUNK) as stream:
+            audio_generator = stream.generator()
+            requests = (
+                speech.StreamingRecognizeRequest(audio_content=chunk)
+                for chunk in audio_generator
+            )
+            responses = client.streaming_recognize(streaming_config, requests)
             listen_print_loop(responses)
-        except Exception:
-            print("Excption handle : Exceeded maximum allowed stream duration ")
-            main()
-        
+    except Exception as exc:
+        print(f"[WARN] Stream exceeded max duration or error occurred: {exc}")
+        print("[INFO] Restarting stream...")
+        main()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
